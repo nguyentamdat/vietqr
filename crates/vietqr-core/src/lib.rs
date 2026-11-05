@@ -1,4 +1,4 @@
-#![doc = include_str!("../../../README.md")]
+//! Offline VietQR (NAPAS 247 / EMVCo MPM) payload generation, parsing and validation. See the repository README for usage.
 pub mod banks;
 pub mod tlv;
 

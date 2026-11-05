@@ -5,7 +5,12 @@ description = "JSON string WASM bindings for offline VietQR generation, parsing 
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -14,8 +19,8 @@ crate-type = ["cdylib", "rlib"]
 wasm-opt = ["-Oz"]
 
 [dependencies]
-vietqr-core = { path = "../vietqr-core" }
-vietqr-render = { path = "../vietqr-render" }
+vietqr-core = { path = "../vietqr-core", version = "0.1.0" }
+vietqr-render = { path = "../vietqr-render", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wasm-bindgen = "0.2"

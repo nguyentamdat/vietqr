@@ -6,6 +6,11 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
+repository = "https://github.com/nguyentamdat/vietqr"
+homepage = "https://nguyentamdat.github.io/nguyentamdat/vietqr/"
+authors = ["nguyentamdat <nguyentamdat@gmail.com>"]
+keywords = ["vietqr", "napas", "emvco", "qrcode", "payment"]
+categories = ["encoding", "finance"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
