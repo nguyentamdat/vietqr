@@ -1,6 +1,6 @@
 use vietqr_core::{
-    Error, MAX_AMOUNT, MAX_PAYLOAD_LEN, Service, Transfer, banks, crc16, generate, parse,
-    strip_vietnamese_diacritics, tlv, validate,
+    Error, MAX_AMOUNT, MAX_PAYLOAD_LEN, Profile, Service, Transfer, banks, crc16, generate,
+    generate_with_profile, parse, strip_vietnamese_diacritics, tlv, validate,
 };
 
 fn transfer() -> Transfer<'static> {
@@ -38,7 +38,7 @@ fn change(payload: &str, id: u8, value: Option<&str>) -> String {
 fn crc16_known_check_vector() {
     assert_eq!(crc16(b"123456789"), 0x29b1);
     assert_eq!(crc16(b""), 0xffff);
-    let payload = generate(&transfer()).unwrap();
+    let payload = generate_with_profile(&transfer(), Profile::Strict).unwrap();
     assert_eq!(
         payload,
         "00020101021138540010A00000072701240006970436011000000000000208QRIBFTTA53037045802VN6304BF8F"
@@ -93,8 +93,11 @@ fn npm_reference_vectors() {
             memo: optional(5),
         };
         let generated = generate(&input).unwrap();
-        // Byte equality after the documented removal of npm's default name and city tags.
-        assert_eq!(generated, cols[7]);
+        assert_eq!(generated, cols[6]); // Default profile matches raw npm bytes.
+        assert_eq!(
+            generate_with_profile(&input, Profile::Strict).unwrap(),
+            cols[7]
+        );
         let reference = parse(cols[6]).unwrap();
         let parsed = parse(&generated).unwrap();
         assert_eq!(reference.bank_bin, parsed.bank_bin);
@@ -170,7 +173,7 @@ fn input_boundaries_and_accents() {
         assert_eq!(generate(&input), Err(Error::InvalidAmount));
     }
     input = transfer();
-    for memo in ["", "😸", "a\nb", "pay!", "12345678901234567890123456"] {
+    for memo in ["", "😸", "a\nb", "pay!"] {
         input.memo = Some(memo);
         assert_eq!(generate(&input), Err(Error::InvalidMemo));
     }
@@ -178,7 +181,7 @@ fn input_boundaries_and_accents() {
     input.name = Some("ĐẶNG THỊ ÁNH");
     let payload = generate(&input).unwrap();
     assert_eq!(parse(&payload).unwrap().name, Some("DANG THI ANH"));
-    for name in ["", "é\n", "12345678901234567890123456"] {
+    for name in ["", "é\n"] {
         input.name = Some(name);
         assert_eq!(generate(&input), Err(Error::InvalidName));
     }
@@ -190,6 +193,56 @@ fn input_boundaries_and_accents() {
         strip_vietnamese_diacritics("Đo\u{0301}ng tie\u{0302}\u{0300}n a\u{0306}n"),
         "Dong tien an"
     );
+}
+#[test]
+fn generation_profiles_text_boundaries_and_defaults() {
+    assert_eq!(Profile::default(), Profile::Npm);
+    let npm = generate(&transfer()).unwrap();
+    let strict = generate_with_profile(&transfer(), Profile::Strict).unwrap();
+    assert_eq!(parse(&npm).unwrap().name, Some("NA"));
+    assert_eq!(parse(&strict).unwrap().name, None);
+    assert!(
+        tlv::decode(&npm)
+            .unwrap()
+            .iter()
+            .any(|f| f.id == 60 && f.value == "VN")
+    );
+    assert!(
+        !tlv::decode(&strict)
+            .unwrap()
+            .iter()
+            .any(|f| f.id == 59 || f.id == 60)
+    );
+    for length in [25, 26, 50, 51] {
+        // Multi-byte input is measured only after removing accents.
+        let text = "đ".repeat(length);
+        let plain = "d".repeat(length);
+        for memo in [false, true] {
+            let input = Transfer {
+                name: (!memo).then_some(text.as_str()),
+                memo: memo.then_some(text.as_str()),
+                ..transfer()
+            };
+            let error = if memo {
+                Error::InvalidMemo
+            } else {
+                Error::InvalidName
+            };
+            for (profile, limit) in [(Profile::Npm, 50), (Profile::Strict, 25)] {
+                let result = generate_with_profile(&input, profile);
+                if length > limit {
+                    assert_eq!(result, Err(error.clone()));
+                } else {
+                    let payload = result.unwrap();
+                    let parsed = parse(&payload).unwrap();
+                    assert_eq!(
+                        if memo { parsed.memo } else { parsed.name },
+                        Some(plain.as_str())
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -262,7 +315,7 @@ fn parser_rejects_invalid_profile_with_valid_crc() {
 
 #[test]
 fn parser_crc_unknown_tags_and_length_limit() {
-    let payload = generate(&transfer()).unwrap();
+    let payload = generate_with_profile(&transfer(), Profile::Strict).unwrap();
     let mut bad = payload.clone().into_bytes();
     *bad.last_mut().unwrap() = b'0';
     assert_eq!(
@@ -314,13 +367,13 @@ fn parser_checks_text_and_nested_structure() {
         ..transfer()
     };
     let payload = generate(&input).unwrap();
-    for name in ["bad\nname", "12345678901234567890123456"] {
+    for name in ["bad\nname", &"x".repeat(51)] {
         assert_eq!(
             parse(&change(&payload, 59, Some(name))),
             Err(Error::InvalidName)
         );
     }
-    for memo in ["bad!", "12345678901234567890123456"] {
+    for memo in ["bad!", &"x".repeat(51)] {
         let additional = tlv::encode(8, memo).unwrap();
         assert_eq!(
             parse(&change(&payload, 62, Some(&additional))),

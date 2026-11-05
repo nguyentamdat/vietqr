@@ -1,0 +1,14 @@
+[package]
+name = "vietqr-render"
+version = "0.1.0"
+description = "Offline QR SVG rendering for VietQR payloads"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+
+[lints]
+workspace = true

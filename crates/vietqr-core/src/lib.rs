@@ -10,6 +10,16 @@ pub const MAX_MEMO_LEN: usize = 25;
 pub const MAX_NAME_LEN: usize = 25;
 pub const MAX_ACCOUNT_LEN: usize = 50;
 pub const MAX_PAYLOAD_LEN: usize = 512;
+/// npm-compatible text limit; the existing MAX_MEMO_LEN/MAX_NAME_LEN describe strict mode.
+pub const COMPAT_MAX_TEXT_LEN: usize = 50;
+
+/// Generation profile; parsing accepts payloads from either profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Profile {
+    #[default]
+    Npm,
+    Strict,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -148,8 +158,7 @@ fn check_amount(amount: u64) -> Result<(), Error> {
         Ok(())
     }
 }
-fn check_text(text: &str, memo: bool) -> Result<(), Error> {
-    let max = if memo { MAX_MEMO_LEN } else { MAX_NAME_LEN };
+fn check_text(text: &str, memo: bool, max: usize) -> Result<(), Error> {
     let valid = !text.is_empty()
         && text.len() <= max
         && text.bytes().all(|b| {
@@ -169,6 +178,11 @@ fn check_text(text: &str, memo: bool) -> Result<(), Error> {
 }
 
 pub fn generate(input: &Transfer<'_>) -> Result<String, Error> {
+    generate_with_profile(input, Profile::default())
+}
+
+/// Generates with npm defaults or the conservative strict profile; never truncates text.
+pub fn generate_with_profile(input: &Transfer<'_>, profile: Profile) -> Result<String, Error> {
     check_beneficiary(input.bank_bin, input.account, input.service)?;
     if let Some(amount) = input.amount {
         check_amount(amount)?;
@@ -184,14 +198,33 @@ pub fn generate(input: &Transfer<'_>) -> Result<String, Error> {
         payload.push_str(&encode(54, &amount.to_string())?);
     }
     payload.push_str(&encode(58, "VN")?);
-    if let Some(name) = input.name {
+    if let Some(name) = input.name.or((profile == Profile::Npm).then_some("NA")) {
         let name = strip_vietnamese_diacritics(name);
-        check_text(&name, false)?;
+        check_text(
+            &name,
+            false,
+            if profile == Profile::Strict {
+                MAX_NAME_LEN
+            } else {
+                COMPAT_MAX_TEXT_LEN
+            },
+        )?;
         payload.push_str(&encode(59, &name)?);
+    }
+    if profile == Profile::Npm {
+        payload.push_str(&encode(60, "VN")?);
     }
     if let Some(memo) = input.memo {
         let memo = strip_vietnamese_diacritics(memo);
-        check_text(&memo, true)?;
+        check_text(
+            &memo,
+            true,
+            if profile == Profile::Strict {
+                MAX_MEMO_LEN
+            } else {
+                COMPAT_MAX_TEXT_LEN
+            },
+        )?;
         payload.push_str(&encode(62, &encode(8, &memo)?)?);
     }
     payload.push_str("6304");
@@ -273,12 +306,12 @@ pub fn parse(payload: &str) -> Result<Parsed<'_>, Error> {
     expect(&fields, 1, if amount.is_some() { "12" } else { "11" })?;
     let name = get(&fields, 59);
     if let Some(name) = name {
-        check_text(name, false)?;
+        check_text(name, false, COMPAT_MAX_TEXT_LEN)?;
     }
     let additional = get(&fields, 62).map(decode).transpose()?;
     let memo = additional.as_ref().and_then(|fields| get(fields, 8));
     if let Some(memo) = memo {
-        check_text(memo, true)?;
+        check_text(memo, true, COMPAT_MAX_TEXT_LEN)?;
     }
     Ok(Parsed {
         bank_bin,

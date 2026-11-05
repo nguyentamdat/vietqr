@@ -1,8 +1,9 @@
-# vietqr-core
+# vietqr
 
-Core Rust offline tạo/đọc chuỗi **VietQR NAPAS 247** (EMVCo Merchant-Presented Mode,
-profile chuyển khoản theo TCCS 03:2018/NHNN). Một workspace, một library,
-**không dependency**, không mạng, filesystem, thread hay clock trong core.
+Workspace Rust offline tạo/đọc chuỗi **VietQR NAPAS 247** (EMVCo Merchant-Presented
+Mode, profile chuyển khoản theo TCCS 03:2018/NHNN), render SVG và WASM adapter.
+Ba crate: `vietqr-core`, `vietqr-render`, `vietqr-wasm`. Core **không dependency**,
+không mạng, filesystem, thread hay clock.
 MIT; repo chỉ local, chưa quyết định public/private. `publish = false`.
 
 ## Dùng thử
@@ -36,8 +37,15 @@ fn main() -> Result<(), vietqr_core::Error> {
 ### API
 
 - `generate(&Transfer) -> Result<String, Error>`; `Service::{Account, Card}`.
+  Mặc định `Profile::Npm`: luôn thêm `60=VN`, `59=NA` khi không name;
+  name/memo tối đa 50 sau bỏ dấu, **lỗi thay vì cắt**.
+- `generate_with_profile(&Transfer, Profile::Strict)` giữ hành vi bước 1:
+  không thêm tag 59/60 mặc định, name/memo tối đa 25, lỗi khi vượt.
+  Signature `generate`, `Transfer`, `Parsed`, `Service` không đổi; caller muốn
+  payload cũ cần chọn strict. `MAX_MEMO_LEN`/`MAX_NAME_LEN` vẫn là trần strict;
+  `COMPAT_MAX_TEXT_LEN=50` là trần npm.
 - `parse(&str) -> Result<Parsed<'_>, Error>` mượn các field từ payload gốc;
-  `validate(&str) -> Result<(), Error>` dùng cùng validation.
+  `validate(&str) -> Result<(), Error>` dùng cùng validation, nhận cả hai profile (name/memo tối đa 50).
 - `tlv::{encode, decode, Field}`: ID `u8` 0–99, độ dài byte 1–99,
   từ chối ID trùng trong mỗi template, header sai, thiếu byte và cắt giữa UTF-8.
 - `crc16(&[u8]) -> u16`: CCITT-FALSE; generate tính trên cả `6304`,
@@ -60,8 +68,9 @@ fn main() -> Result<(), vietqr_core::Error> {
 | account | 1–50 chữ/số ASCII, giữ nguyên, không bỏ dấu cách/gạch ngang |
 | card | 1–19 chữ số ASCII (trần PAN); không kiểm tra Luhn, độ dài tối thiểu theo issuer hay tồn tại thẻ |
 | 53, 54, 58 | `704`, amount nguyên VND `1..=9_999_999_999_999` (13 chữ số), `VN`; `Some(0)` là lỗi |
-| 59 (tuỳ chọn) | 1–25 ASCII in được sau bỏ dấu; không tự thêm `NA` |
-| 62.08 (tuỳ chọn) | 1–25 ký tự sau bỏ dấu: chữ/số ASCII, dấu cách và `-.,_@/():`; không emoji/control |
+| 59 | 1–50 ASCII in được sau bỏ dấu ở npm, 1–25 ở strict; npm thêm `NA` nếu thiếu |
+| 60 | npm luôn thêm `VN`; strict không thêm |
+| 62.08 (tuỳ chọn) | 1–50 ký tự ở npm, 1–25 ở strict, sau bỏ dấu: chữ/số ASCII, dấu cách và `-.,_@/():`; không emoji/control |
 | TLV / tổng | mỗi value 1–99 byte; toàn payload tối đa **512 byte** (giới hạn profile local) |
 
 **Bất định spec:** EMVCo MPM v1.1, bảng Additional Data Field Template,
@@ -69,12 +78,12 @@ fn main() -> Result<(), vietqr_core::Error> {
 **25**, Transaction Amount `54` tối đa **13**. Thực tế npm `@viet-qr/core@1.4.0`
 đã kiểm tra ngày **2026-11-05** cắt memo/tên ở **50**, account tối đa 50 và
 cho BIN 6–8 chữ số. Đây là khác biệt ecosystem, **không coi 50 là giới hạn chuẩn
-62.08**. Crate chọn trần 25 thận trọng, lỗi thay vì cắt. Charset memo theo subset
+62.08**. Strict chọn trần 25 thận trọng; default npm chọn 50, cả hai lỗi thay vì cắt. Charset memo theo subset
 npm đã kiểm tra. Trần account 50 là profile tương thích npm, card 19 và tổng 512
 là giới hạn local; chưa xác nhận lại các trần này với tài liệu NAPAS chính thức.
 Không tải trực tiếp tài liệu chuẩn/API do ràng buộc mạng của bước này; cần đối chiếu
 bản TCCS/NAPAS ngân hàng đang áp dụng trước production. Không tuyên bố chứng nhận
-EMVCo/NAPAS hoặc hỗ trợ toàn bộ merchant QR (không tự thêm MCC/merchant city).
+EMVCo/NAPAS hoặc hỗ trợ toàn bộ merchant QR (không tự thêm MCC; merchant city default chỉ để tương thích npm).
 
 Parser kiểm tra cấu trúc và ID trùng ở top-level, `38`, `38.01`, `62`; kiểm tra
 ngữ nghĩa các field profile trên. Unknown tags được bỏ qua, value opaque
@@ -87,9 +96,8 @@ trong ví dụ để chuyển tiền thật.
 ## Tests và cross-check
 
 ```sh
-cargo test
-cargo clippy -- -D warnings
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --check
 ```
 
@@ -109,12 +117,69 @@ cargo test npm_reference_vectors
 ```
 
 6 input giống nhau: static, dynamic, card, account chữ/số, amount/memo sát trần,
-memo tiếng Việt. **Raw payload không byte-equal** vì npm luôn thêm `60=VN` và
-thêm `59=NA` nếu thiếu tên. Script bỏ đúng các mặc định này, tính lại CRC bằng
-npm; tests Rust assert byte-equal với cột core-profile, đồng thời parse raw npm
-và so sánh các field. Parser npm cũng assert nhận cả hai profile.
+memo tiếng Việt. **Default byte-equal RAW npm cả 6 vector**. Strict byte-equal
+cột strict-profile (bỏ đúng default `60=VN` và `59=NA` khi thiếu name, tính lại CRC).
+Không cần truncate để đạt byte-equality cho 6 vector; input vượt trần vẫn lỗi,
+khác npm cắt âm thầm. Cả parser Rust và npm nhận hai profile.
 `vietqr@1.1.9` (Casso/MIT) chỉ là client API; không gọi API, không dùng credentials.
 Không có npm dependency hay `node_modules` trong repo.
+
+## SVG và WASM
+
+`vietqr-render::render_svg(&str) -> Result<String, QrError>` dùng
+[`qrcode` 0.14](https://crates.io/crates/qrcode) (không default features; chỉ svg).
+QR thường, ECC **M**, quiet zone **4 module**, đen/trắng, viewBox một unit/module;
+scale bằng CSS khi hiển thị. Chuỗi bắt đầu `<svg`, không có XML header. Renderer
+nhận chuỗi bất kỳ, **không validate VietQR**; gọi `parse` trước nếu cần.
+Không nhúng payload dưới dạng markup; không có PNG, logo hay màu tuỳ biến.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack --locked # nếu chưa có
+wasm-pack build crates/vietqr-wasm --target web --out-dir ../../target/wasm-web --locked
+# Test Node dùng build riêng, không dùng web glue trong require():
+wasm-pack build crates/vietqr-wasm --target nodejs --out-dir /tmp/vietqr-node --locked
+```
+
+Release dùng `opt-level="z"`, LTO, một codegen unit và strip. Build artifacts không
+commit. `vietqr-wasm` dùng wasm-bindgen; API JS **chuỗi vào/ra**, lỗi throw string:
+
+- `generate(jsonOptions) -> payload`: `bank_bin`, `account` là chuỗi bắt buộc,
+  `service: 'account' | 'card'` bắt buộc; optional `amount` (integer VND), `name`,
+  `memo`, `profile: 'npm' | 'strict'` (default npm). Reject unknown fields/types.
+  Optional amount/name/memo được phép thiếu hoặc null. Không dùng BigInt cho JSON;
+  MAX_AMOUNT < Number.MAX_SAFE_INTEGER. Không tự chọn bank/service hay trim.
+- `parse(payload) -> json`: `bank_bin`, `account`, `service`, `amount`, `name`,
+  `memo`; optional vắng trả null. Không trả profile/city; không lưu text gốc có dấu.
+- `render_svg(payload) -> svg`: giống Rust renderer; lỗi khi vượt sức chứa QR.
+- `banks() -> json`: mảng `{bin, code, name}` từ snapshot 18 ngân hàng trong core.
+
+```js
+import init, { generate, parse, render_svg, banks } from './vietqr_wasm.js';
+await init(); // Web target: tải .wasm bên cạnh JS qua import.meta.url
+const payload = generate(JSON.stringify({
+  bank_bin: '970436', account: '0000000000', service: 'account',
+  amount: 50000, memo: 'Đóng tiền ăn', // profile: 'strict' để dùng profile cũ
+}));
+const fields = JSON.parse(parse(payload));
+const svg = render_svg(payload);
+const bankList = JSON.parse(banks());
+```
+
+### Bước 3: Next.js static export / GitHub Pages
+
+Repo demo riêng `nguyentamdat/my-site`: `output: 'export'`, `basePath: '/my-site'`.
+Copy `vietqr_wasm.js` và `vietqr_wasm_bg.wasm` từ build **web** vào
+`public/wasm/` (giữ cùng thư mục); `.d.ts` dùng khi cần type checking.
+Trong client component (`'use client'`), load module và `await init(...)` trong
+`useEffect`/event trước khi gọi API, **không ở SSR/build-time**. Nếu load JS trực
+tiếp từ public, dùng browser dynamic import URL `/my-site/wasm/vietqr_wasm.js`
+(ví dụ `import(/* webpackIgnore: true */ url)` với Webpack); không để bundler
+resolve file public như source dependency. Init rõ URL:
+`await module.default({ module_or_path: '/my-site/wasm/vietqr_wasm_bg.wasm' })`.
+Next basePath không tự prefix chuỗi URL public; không fetch `/wasm/...` ở root.
+Có thể để init mặc định resolve WASM cạnh JS, nhưng URL JS vẫn phải có basePath.
+Không cần server/API route cho demo; chưa sửa/chạy repo Next.js ở bước này.
 
 ## Nguồn
 
@@ -131,10 +196,11 @@ Không có npm dependency hay `node_modules` trong repo.
 
 ## English
 
-Small, dependency-free Rust workspace for offline VietQR NAPAS 247 payloads:
-TLV, CRC16-CCITT-FALSE, account/card generation, strict parsing and bank lookup.
-See the example above. The conservative profile limits memo/name to 25 ASCII
-characters and payloads to 512 bytes; npm compatibility differences and unverified
-NAPAS-specific limits are documented above. Valid CRC is not payment confirmation.
-Local-only, MIT, publishing disabled. Step 2 may add QR rendering/WASM bindings;
-this step does not include images, browser integration, servers or payment calls.
+Offline VietQR Rust workspace: dependency-free core, QR SVG renderer (ECC M,
+quiet zone 4), and wasm-bindgen JSON-string bindings. Default generation matches
+npm defaults (59=NA if unnamed, 60=VN, memo/name limit 50); opt into
+`generate_with_profile(..., Profile::Strict)` for the original 25-character profile
+without defaults. Neither profile truncates. Parsing accepts both profiles.
+Payload limit: 512 bytes. Unverified NAPAS-specific limits remain documented above.
+Valid CRC is not payment confirmation. Local-only, MIT, publishing disabled.
+No PNG, server, payment calls or demo UI in this repository.

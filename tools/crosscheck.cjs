@@ -21,11 +21,11 @@ function fields(payload) {
   return result;
 }
 console.log('# @viet-qr/core 1.4.0; 2026-11-05; fake accounts only');
-console.log('# bin\taccount\tservice\tamount\tname\tinput memo\tnpm raw\tcore profile');
+console.log('# bin\taccount\tservice\tamount\tname\tinput memo\tnpm raw\tstrict profile');
 for (const [bankId, accountNo, isCard, amount, accountName, content] of cases) {
   const raw = generateVietQR({bankId, accountNo, isCard, amount, accountName, content});
   assert.equal(parseVietQR(raw).isValid, true);
-  // Intentional profile difference: no default 59=NA, no 60=VN (merchant city).
+  // Strict (opt-in) profile difference: no default 59=NA, no 60=VN (merchant city).
   const body = fields(raw).filter(([id]) => id !== '63' && id !== '60' && !(id === '59' && accountName === undefined))
     .map(([id, value]) => id + String(value.length).padStart(2, '0') + value).join('') + '6304';
   const core = body + calculateCRC16(body);
