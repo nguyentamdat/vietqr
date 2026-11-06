@@ -1,6 +1,6 @@
 [package]
 name = "vietqr-render"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offline QR SVG rendering for VietQR payloads"
 edition.workspace = true
 license.workspace = true

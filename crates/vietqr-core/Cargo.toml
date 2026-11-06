@@ -1,6 +1,6 @@
 [package]
 name = "vietqr-core"
-version = "0.1.0"
+version = "0.1.1"
 description = "Offline VietQR NAPAS 247 payload generation and validation"
 edition.workspace = true
 license.workspace = true
