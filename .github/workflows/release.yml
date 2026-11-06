@@ -1,0 +1,60 @@
+name: Release
+
+# Push a tag vX.Y.Z (matching the workspace version) to publish.
+# No long-lived tokens: crates.io and npm both use trusted publishing (OIDC).
+# npm side only stages; a maintainer approves the release on npmjs.com with 2FA.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Tag must match workspace version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="vietqr-core") | .version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Build npm package
+        run: |
+          wasm-pack build crates/vietqr-wasm --release --target web --out-dir "$RUNNER_TEMP/npm" --locked
+          cp README.md LICENSE "$RUNNER_TEMP/npm/"
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: crates
+      - name: Publish crates
+        run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install -g npm@latest
+      - name: Stage npm package (approve on npmjs.com)
+        working-directory: ${{ runner.temp }}/npm
+        run: npm stage publish --access public
