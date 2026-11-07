@@ -22,9 +22,14 @@ fn input() -> Value {
 }
 
 fn handler() -> Router {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
     Router::new()
         .route("/v1/qr", post(qr))
+        .layer(Extension(shops::KeyShop(None)))
         .layer(DefaultBodyLimit::max(360 * 1024))
+        .with_state(AppState::new(pool))
 }
 
 async fn body(response: Response) -> Vec<u8> {

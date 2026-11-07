@@ -124,7 +124,7 @@ khác npm cắt âm thầm. Cả parser Rust và npm nhận hai profile.
 `vietqr@1.1.9` (Casso/MIT) chỉ là client API; không gọi API, không dùng credentials.
 Không có npm dependency hay `node_modules` trong repo.
 
-## Server M1 (Postgres, chạy local)
+## Server M1–M2 (Postgres, chạy local)
 
 ```sh
 # Chỉ dùng database riêng/disposable cho ví dụ và test.
@@ -161,17 +161,56 @@ curl -sS -D /tmp/qr-headers -o /tmp/qr.png http://127.0.0.1:3000/v1/qr \
   -H "Authorization: Bearer $VIETQR_KEY" -H 'Content-Type: application/json' \
   -d '{"bank_bin":"970436","account":"0000000000","amount":10000,"memo":"TEST M1","format":"png"}'
 # DB test không tự chạy trong cargo test --workspace:
-TEST_DATABASE_URL="$DATABASE_URL" cargo test -p vietqr-server --test postgres -- --ignored
+TEST_DATABASE_URL="$DATABASE_URL" cargo test -p vietqr-server --test postgres --test shops_payment -- --ignored
 # Build/run local, không publish image:
 docker build -t vietqr-server:m1 .
 docker run --rm -p 127.0.0.1:3000:3000 -e DATABASE_URL='<URL DB container truy cập được>' vietqr-server:m1
 # CLI tạo key trong image: thêm `create-key` sau tên image.
 ```
 
-Không log/lưu payload hay logo; chỉ lưu bảng `api_keys` và metadata migration sqlx.
+Không log/lưu payload QR tạm thời; template/logo PNG và link được lưu trong Postgres.
 Chỉ đưa API ra ngoài sau reverse proxy HTTPS; không gửi key qua HTTP công khai.
 Test rqrr decode logo là kiểm tra tự động, **không thay thế quét app ngân hàng thật**.
 Không dùng tài khoản giả trong ví dụ để chuyển tiền thật.
+
+### Template và link thanh toán (M2)
+
+Shop được cấp thủ công trong DB (chưa có đăng ký/billing/admin):
+
+```sql
+INSERT INTO shops (name, bank_bin, account, account_name)
+VALUES ('Quán Test', '970436', '0000000000', NULL) RETURNING id;
+-- Gắn key đã tạo vào shop; key cũ NULL vẫn gọi /v1/qr không template được.
+UPDATE api_keys SET shop_id = <shop_id> WHERE prefix = '<prefix_key>';
+```
+
+- Bearer key chỉ truy cập shop của mình; key không shop → 403 cho quản lý/template_id,
+  tài nguyên shop khác → 404. Không có API đổi tài khoản/plan ở M2.
+- `POST /v1/templates` → 201; `GET /v1/templates` → danh sách;
+  `GET/PATCH/DELETE /v1/templates/{id}` → đọc/sửa/xoá (200/200/204).
+  JSON: `name` bắt buộc (1–100 ký tự), `logo` base64 PNG/JPEG hoặc null,
+  `fg_color`/`bg_color` dạng `#RRGGBB` (default đen/trắng), `frame` = `none|border`,
+  `show_shop_name` (default false). Chỉ cho module tối trên nền sáng (luminance ≤0.2/≥0.8,
+  contrast ≥7:1), sai → 400. Logo lưu PNG raster thu nhỏ ≤240×240; response logo là base64 PNG.
+  Mỗi PATCH tăng `version`; xoá template đang được link tham chiếu → 409 (gỡ tham chiếu trước).
+- `POST /v1/links` → 201; `GET /v1/links` → danh sách;
+  `GET/PATCH /v1/links/{id}` → 200; `DELETE /v1/links/{id}` → 204 **vô hiệu hoá**, không xoá dữ liệu.
+  JSON: `slug` bắt buộc, unique toàn hệ thống `[a-z0-9-]{3,40}`, `template_id`,
+  `default_amount` (nguyên VND), `default_memo` nullable; `active` default true.
+  PATCH chỉ gửi field cần đổi; null xoá field nullable. Slug trùng → 409.
+- `POST /v1/qr` thêm `template_id` của shop; không gửi đồng thời `logo`.
+  Template áp màu/logo/khung/tên shop; không thay đổi bank/account trong request.
+- `GET /p/{slug}` công khai, HTML tiếng Việt, copy STK/số tiền/memo; CSP hash chỉ cho CSS/script
+  copy cố định, không asset ngoài. `amount`/`memo` query chỉ dùng khi default tương ứng NULL;
+  validate bằng core và hiển thị memo đã ASCII-fold. Memo chứa HTML bị core từ chối 400,
+  mọi text vẫn được HTML-escape. Missing/inactive → 404, cả ảnh.
+- `GET /p/{slug}/qr.png|qr.svg` dùng cùng payload/template với trang. Trang cache 60s;
+  ảnh 3600s + ETag theo bytes render và version (hỗ trợ If-None-Match/304).
+  Cache ảnh đã tải có thể còn hiệu lực tối đa một giờ sau khi đổi/vô hiệu hoá link.
+  Free có “Tạo bởi VietQR” trên trang và dưới ảnh; plan khác không watermark.
+- Chưa có deep link ngân hàng, webhook hay xử lý tiền. Copy cần HTTPS/localhost;
+  thất bại sẽ nhắc sao chép thủ công. Font DejaVu Sans được nhúng để PNG/SVG giữ dấu tiếng Việt
+  (license kèm trong `crates/vietqr-server/assets/`).
 
 ## SVG và WASM
 

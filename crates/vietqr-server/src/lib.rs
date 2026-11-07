@@ -1,4 +1,6 @@
+mod payment;
 mod render;
+mod shops;
 
 use std::{
     collections::HashMap,
@@ -7,7 +9,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
@@ -39,9 +41,28 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/qr", post(qr))
+        .route(
+            "/v1/templates",
+            post(shops::create_template).get(shops::list_templates),
+        )
+        .route(
+            "/v1/templates/{id}",
+            get(shops::get_template)
+                .patch(shops::update_template)
+                .delete(shops::delete_template),
+        )
+        .route("/v1/links", post(shops::create_link).get(shops::list_links))
+        .route(
+            "/v1/links/{id}",
+            get(shops::get_link)
+                .patch(shops::update_link)
+                .delete(shops::deactivate_link),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(360 * 1024))
         .route("/healthz", get(|| async { "ok\n" }))
+        .route("/p/{slug}", get(payment::page))
+        .route("/p/{slug}/{image}", get(payment::qr_image))
         .with_state(state)
 }
 
@@ -67,7 +88,7 @@ pub async fn create_key(pool: &PgPool) -> Result<String, Box<dyn std::error::Err
 
 async fn authenticate(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     let key = request
@@ -77,16 +98,18 @@ async fn authenticate(
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|key| !key.is_empty() && key.len() <= 256)
         .ok_or_else(ApiError::unauthorized)?;
-    let id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL")
-            .bind(key_hash(key))
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|error| {
-                eprintln!("API key lookup failed: {error}");
-                ApiError::internal()
-            })?;
-    let id = id.ok_or_else(ApiError::unauthorized)?;
+    let identity: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT id, shop_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
+    )
+    .bind(key_hash(key))
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| {
+        eprintln!("API key lookup failed: {error}");
+        ApiError::internal()
+    })?;
+    let (id, shop_id) = identity.ok_or_else(ApiError::unauthorized)?;
+    request.extensions_mut().insert(shops::KeyShop(shop_id));
     if !state
         .limiter
         .lock()
@@ -158,9 +181,14 @@ struct QrRequest {
     profile: RequestProfile,
     format: Format,
     logo: Option<String>,
+    template_id: Option<i64>,
 }
 
-async fn qr(input: Result<Json<QrRequest>, JsonRejection>) -> Result<Response, ApiError> {
+async fn qr(
+    State(state): State<AppState>,
+    Extension(key): Extension<shops::KeyShop>,
+    input: Result<Json<QrRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
     let Json(input) = input.map_err(|_| {
         ApiError::bad_request(
             "InvalidRequest",
@@ -186,11 +214,29 @@ async fn qr(input: Result<Json<QrRequest>, JsonRejection>) -> Result<Response, A
     )
     .map_err(ApiError::from)?;
     let payload_header = HeaderValue::from_str(&payload).map_err(|_| ApiError::internal())?;
-    let bytes = tokio::task::spawn_blocking(move || {
-        render::render(&payload, input.format, input.logo.as_deref())
-    })
-    .await
-    .map_err(|_| ApiError::internal())??;
+    let style = if let Some(id) = input.template_id {
+        if input.logo.is_some() {
+            return Err(ApiError::bad_request(
+                "InvalidRequest",
+                "logo and template_id are mutually exclusive",
+            ));
+        }
+        let template = shops::owned_template(&state.pool, key.required()?, id).await?;
+        let shop = shops::shop(&state.pool, key.required()?).await?;
+        template.style(&shop)?
+    } else {
+        render::Style {
+            logo: input
+                .logo
+                .as_deref()
+                .map(render::normalize_logo)
+                .transpose()?,
+            ..Default::default()
+        }
+    };
+    let bytes = tokio::task::spawn_blocking(move || render::render(&payload, input.format, &style))
+        .await
+        .map_err(|_| ApiError::internal())??;
     let content_type = match input.format {
         Format::Png => "image/png",
         Format::Svg => "image/svg+xml",
@@ -209,6 +255,27 @@ async fn qr(input: Result<Json<QrRequest>, JsonRejection>) -> Result<Response, A
         .into_response())
 }
 
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        match &error {
+            sqlx::Error::RowNotFound => Self::new(StatusCode::NOT_FOUND, "NotFound", "Not found"),
+            sqlx::Error::Database(db)
+                if db.is_unique_violation() || db.is_foreign_key_violation() =>
+            {
+                Self::new(
+                    StatusCode::CONFLICT,
+                    "Conflict",
+                    "Slug already exists or resource is referenced",
+                )
+            }
+            _ => {
+                eprintln!("Database error: {error}");
+                Self::internal()
+            }
+        }
+    }
+}
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
