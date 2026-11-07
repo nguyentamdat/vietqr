@@ -1,5 +1,6 @@
 FROM rust:1.95-bookworm AS build
 WORKDIR /app
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=3
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --locked --release -p vietqr-server

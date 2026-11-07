@@ -143,17 +143,26 @@ BIND_ADDR=127.0.0.1:3000 cargo run -p vietqr-server
   tuỳ chọn `service: "account" | "card"` (default account), `profile: "npm" | "strict"`
   (default npm), `name`, `amount` (nguyên VND), `memo`, `logo` (base64 chuẩn, không data URL).
   Các field name/amount/memo/logo có thể thiếu/null; từ chối field lạ.
-- Logo chỉ PNG/JPEG, tối đa **256 KiB decoded**, **2048×2048 pixel**; decode có giới hạn
-  allocation rồi re-encode PNG, không giữ metadata/file gốc, không nhận SVG.
+- Logo chỉ PNG/JPEG, tối đa **256 KiB decoded**, **1024×1024 pixel**; decode có giới hạn
+  allocation 16 MiB rồi re-encode PNG, không giữ metadata/file gốc, không nhận SVG.
   PNG/SVG có logo dùng ECC **H**, ô trắng gồm padding chiếm ≤6,25% diện tích module;
   giữ quiet zone 4 module. PNG 8 pixel/module; SVG nhúng raster logo đã re-encode.
 - Lỗi validation JSON **400** `{ "code": "InvalidBin", "message": "..." }` (mã lỗi
   ngữ nghĩa từ enum core); JSON sai kiểu/format/body quá 360 KiB → `InvalidRequest`,
   logo sai → `InvalidLogo`. Key thiếu/sai/đã thu hồi → **401**; DB lỗi → **500**.
 - **60 request/phút/key**, fixed window trong bộ nhớ (kể cả request validation lỗi);
-  quá hạn → **429**, `Retry-After: 60`. Restart reset bộ đếm; chỉ dùng 1 replica ở M1.
+  quá hạn → **429**, `Retry-After: 60`. Restart reset bộ đếm; chỉ dùng 1 replica.
   Thu hồi bằng `UPDATE api_keys SET revoked_at = now() WHERE id = ...`;
-  kiểm tra DB mỗi request, không cache quyền. M1 chưa có shop/template/billing.
+  kiểm tra DB mỗi request, không cache quyền. Token sai dạng `vqr_` + 64 hex bị loại trước DB;
+  scheme Bearer không phân biệt hoa thường.
+- **120 request/phút/IP** trước auth/DB, áp cả trang/ảnh public; global tối đa **64 request**
+  đang xử lý (đầy → 503, không xếp hàng vô hạn); `/healthz` miễn các giới hạn này.
+  Peer IP lấy từ `ConnectInfo`. `TRUST_CF_CONNECTING_IP=false` mặc định, bỏ qua header CF.
+  Chỉ đặt `true` nếu proxy tin cậy **ghi đè** header và đã chặn mọi truy cập trực tiếp vào backend;
+  nếu không, khách có thể giả IP. Thiếu/header CF lỗi dùng peer IP.
+- Semaphore render theo số CPU giữ cả decode/resize/logo/encode trong blocking task,
+  kể cả request bị huỷ; global limit chặn số request đang chờ slot render.
+  Binary xử lý cả SIGTERM và Ctrl-C để shutdown graceful. Docker build tối ưu server `opt-level=3`.
 
 ```sh
 curl -sS http://127.0.0.1:3000/healthz

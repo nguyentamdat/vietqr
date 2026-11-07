@@ -12,6 +12,7 @@ use tower::ServiceExt;
 
 fn request(body: &Value) -> Request<Body> {
     Request::post("/v1/qr")
+        .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
@@ -214,7 +215,7 @@ async fn handler_png_logo_decodes_exact_payload_and_preserves_quiet_zone() {
 #[tokio::test]
 async fn handler_rejects_unsafe_oversized_and_corrupt_logos() {
     let mut huge = Cursor::new(Vec::new());
-    DynamicImage::ImageRgb8(RgbImage::new(2049, 1))
+    DynamicImage::ImageRgb8(RgbImage::new(1025, 1))
         .write_to(&mut huge, ImageFormat::Png)
         .unwrap();
     for logo in [
@@ -254,6 +255,8 @@ async fn handler_svg_logo_embeds_reencoded_png_only() {
     assert_eq!(tile.get_pixel(0, 0).0, [255, 255, 255, 255]);
     assert!(!svg.contains("image/jpeg"));
     assert!(!svg.contains("<script"));
+    assert!(svg.contains("xmlns:xlink=\"http://www.w3.org/1999/xlink\""));
+    assert!(svg.contains("xlink:href=\"data:image/png;base64,"));
 }
 
 #[test]
@@ -261,11 +264,11 @@ fn rate_limiter_is_per_key_expires_and_cleans_up() {
     let mut limiter = RateLimiter::default();
     let now = Instant::now();
     for _ in 0..60 {
-        assert!(limiter.allow(1, now));
+        assert!(limiter.allow(1, now, 60));
     }
-    assert!(!limiter.allow(1, now + Duration::from_secs(59)));
-    assert!(limiter.allow(2, now));
-    assert!(limiter.allow(1, now + Duration::from_secs(60)));
+    assert!(!limiter.allow(1, now + Duration::from_secs(59), 60));
+    assert!(limiter.allow(2, now, 60));
+    assert!(limiter.allow(1, now + Duration::from_secs(60), 60));
     assert_eq!(limiter.windows.len(), 1);
 }
 
@@ -302,4 +305,146 @@ async fn health_and_missing_or_malformed_auth_need_no_database() {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
     }
+}
+
+#[tokio::test]
+async fn token_format_rejected_before_database_and_bearer_is_case_insensitive() {
+    let token = format!("vqr_{}", "a".repeat(64));
+    for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+        assert_eq!(
+            bearer_token(&format!("{scheme}  {token}")),
+            Some(token.as_str())
+        );
+    }
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let app = router(AppState::new(pool));
+    for token in [
+        "x".into(),
+        "vqr_".into(),
+        format!("vqr_{}", "a".repeat(63)),
+        format!("vqr_{}", "a".repeat(65)),
+        format!("vqr_{}", "g".repeat(64)),
+        format!("other_{}", "a".repeat(64)),
+    ] {
+        let mut req = request(&input());
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("bearer {token}")).unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn per_ip_limit_precedes_auth_and_only_trusts_cf_when_enabled() {
+    for trusted in [false, true] {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let mut state = AppState::new(pool);
+        state.trust_cf_connecting_ip = trusted;
+        let app = router(state);
+        for index in 0..=120 {
+            let mut req = request(&input());
+            // Header spoofing cannot change the bucket in direct mode.
+            let cf = if trusted {
+                "192.0.2.1".into()
+            } else {
+                format!("192.0.2.{}", index + 1)
+            };
+            req.headers_mut()
+                .insert("cf-connecting-ip", HeaderValue::from_str(&cf).unwrap());
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                response.status(),
+                if index < 120 {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+            if index == 120 {
+                assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+            }
+        }
+        let mut other = request(&input());
+        other
+            .extensions_mut()
+            .insert(ConnectInfo("127.0.0.2:1234".parse::<SocketAddr>().unwrap()));
+        other
+            .headers_mut()
+            .insert("cf-connecting-ip", HeaderValue::from_static("192.0.2.2"));
+        assert_eq!(
+            app.oneshot(other).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn global_concurrency_rejects_before_auth_but_health_stays_available() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let state = AppState::new(pool);
+    let permits = state.requests.clone().acquire_many_owned(64).await.unwrap();
+    let app = router(state);
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&input()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    drop(permits);
+    assert_eq!(
+        app.oneshot(request(&input())).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn render_slots_bound_work_and_survive_request_cancellation() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let mut state = AppState::new(pool);
+    state.render_slots = Arc::new(Semaphore::new(1));
+    let permit = state.render_slots.clone().acquire_owned().await.unwrap();
+    let copy = state.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        copy.render_job(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.blocking_recv().unwrap();
+            Ok(())
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    drop(permit);
+    started_rx.await.unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(state.render_slots.available_permits(), 0);
+    finish_tx.send(()).unwrap();
+    let restored = state.render_slots.acquire().await.unwrap();
+    drop(restored);
+    assert_eq!(state.render_slots.available_permits(), 1);
 }

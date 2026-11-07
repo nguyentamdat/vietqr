@@ -169,7 +169,12 @@ pub(super) async fn create_template(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let shop = key.required()?;
     let input: TemplateInput = input(body)?;
-    let logo = input.validate()?;
+    let (input, logo) = state
+        .render_job(move || {
+            let logo = input.validate()?;
+            Ok((input, logo))
+        })
+        .await?;
     let row: Template = sqlx::query_as("INSERT INTO templates (shop_id, name, logo, fg_color, bg_color, frame, show_shop_name) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *")
         .bind(shop).bind(input.name).bind(logo).bind(input.fg_color).bind(input.bg_color).bind(input.frame).bind(input.show_shop_name)
         .fetch_one(&state.pool).await?;
@@ -209,7 +214,12 @@ pub(super) async fn update_template(
     let shop = key.required()?;
     let old = owned_template(&state.pool, shop, id).await?;
     let input: TemplateInput = patched(old.input(), body)?;
-    let logo = input.validate()?;
+    let (input, logo) = state
+        .render_job(move || {
+            let logo = input.validate()?;
+            Ok((input, logo))
+        })
+        .await?;
     let row: Template = sqlx::query_as("UPDATE templates SET name=$3, logo=$4, fg_color=$5, bg_color=$6, frame=$7, show_shop_name=$8, version=version+1 WHERE id=$1 AND shop_id=$2 RETURNING *")
         .bind(id).bind(shop).bind(input.name).bind(logo).bind(input.fg_color).bind(input.bg_color).bind(input.frame).bind(input.show_shop_name)
         .fetch_one(&state.pool).await?;

@@ -9,7 +9,7 @@ license.workspace = true
 vietqr-core = { path = "../vietqr-core" }
 vietqr-render = { path = "../vietqr-render" }
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 getrandom = { version = "0.3", features = ["std"] }

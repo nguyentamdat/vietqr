@@ -1,4 +1,4 @@
-Copyright: Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved. 
+Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
 Bitstream Vera is a trademark of Bitstream, Inc.
 DejaVu changes are in public domain.
 License: bitstream-vera
@@ -42,4 +42,3 @@ otherwise to promote the sale, use or other dealings in this Font Software
 without prior written authorization from the Gnome Foundation or Bitstream
 Inc., respectively. For further information, contact: fonts at gnome dot
 org.
-

@@ -4,13 +4,15 @@ mod shops;
 
 use std::{
     collections::HashMap,
+    hash::Hash,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State, rejection::JsonRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -19,6 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use vietqr_core::{Profile, Service, Transfer};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -26,7 +29,12 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    limiter: Arc<Mutex<RateLimiter>>,
+    limiter: Arc<Mutex<RateLimiter<i64>>>,
+    ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
+    requests: Arc<Semaphore>,
+    render_slots: Arc<Semaphore>,
+    /// Enable only when direct access is blocked and a trusted proxy overwrites CF-Connecting-IP.
+    pub trust_cf_connecting_ip: bool,
 }
 
 impl AppState {
@@ -34,7 +42,32 @@ impl AppState {
         Self {
             pool,
             limiter: Arc::new(Mutex::new(RateLimiter::default())),
+            ip_limiter: Arc::new(Mutex::new(RateLimiter::default())),
+            requests: Arc::new(Semaphore::new(64)),
+            render_slots: Arc::new(Semaphore::new(
+                std::thread::available_parallelism().map_or(1, usize::from),
+            )),
+            trust_cf_connecting_ip: false,
         }
+    }
+
+    async fn render_job<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+    ) -> Result<T, ApiError> {
+        let permit = self
+            .render_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        tokio::task::spawn_blocking(move || {
+            // Keep the permit inside the blocking task even if its HTTP request is cancelled.
+            let _permit = permit;
+            work()
+        })
+        .await
+        .map_err(|_| ApiError::internal())?
     }
 }
 
@@ -60,9 +93,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(360 * 1024))
-        .route("/healthz", get(|| async { "ok\n" }))
         .route("/p/{slug}", get(payment::page))
         .route("/p/{slug}/{image}", get(payment::qr_image))
+        .layer(middleware::from_fn_with_state(state.clone(), guard_request))
+        .route("/healthz", get(|| async { "ok\n" }))
         .with_state(state)
 }
 
@@ -86,6 +120,59 @@ pub async fn create_key(pool: &PgPool) -> Result<String, Box<dyn std::error::Err
     Ok(key)
 }
 
+async fn guard_request(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let _permit = state.requests.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Busy",
+            "Too many concurrent requests",
+        )
+    })?;
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .ok_or_else(ApiError::internal)?
+        .0
+        .ip();
+    let ip = if state.trust_cf_connecting_ip {
+        request
+            .headers()
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(peer)
+    } else {
+        peer
+    };
+    if !state
+        .ip_limiter
+        .lock()
+        .map_err(|_| ApiError::internal())?
+        .allow(ip, Instant::now(), 120)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RateLimited",
+            "120 requests per minute per IP",
+        ));
+    }
+    Ok(next.run(request).await)
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("bearer")
+        && token.len() == 68
+        && token.starts_with("vqr_")
+        && token.as_bytes()[4..].iter().all(u8::is_ascii_hexdigit))
+    .then_some(token)
+}
+
 async fn authenticate(
     State(state): State<AppState>,
     mut request: Request,
@@ -95,8 +182,7 @@ async fn authenticate(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|key| !key.is_empty() && key.len() <= 256)
+        .and_then(bearer_token)
         .ok_or_else(ApiError::unauthorized)?;
     let identity: Option<(i64, Option<i64>)> = sqlx::query_as(
         "SELECT id, shop_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
@@ -114,7 +200,7 @@ async fn authenticate(
         .limiter
         .lock()
         .map_err(|_| ApiError::internal())?
-        .allow(id, Instant::now())
+        .allow(id, Instant::now(), 60)
     {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -125,18 +211,25 @@ async fn authenticate(
     Ok(next.run(request).await)
 }
 
-#[derive(Default)]
-struct RateLimiter {
-    windows: HashMap<i64, (Instant, u32)>,
+struct RateLimiter<K> {
+    windows: HashMap<K, (Instant, u32)>,
 }
 
-impl RateLimiter {
-    fn allow(&mut self, id: i64, now: Instant) -> bool {
+impl<K> Default for RateLimiter<K> {
+    fn default() -> Self {
+        Self {
+            windows: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> RateLimiter<K> {
+    fn allow(&mut self, id: K, now: Instant, limit: u32) -> bool {
         let window = Duration::from_secs(60);
         self.windows
             .retain(|_, (start, _)| now.duration_since(*start) < window);
         let (_, count) = self.windows.entry(id).or_insert((now, 0));
-        if *count >= 60 {
+        if *count >= limit {
             return false;
         }
         *count += 1;
@@ -225,18 +318,17 @@ async fn qr(
         let shop = shops::shop(&state.pool, key.required()?).await?;
         template.style(&shop)?
     } else {
-        render::Style {
-            logo: input
-                .logo
-                .as_deref()
-                .map(render::normalize_logo)
-                .transpose()?,
-            ..Default::default()
-        }
+        render::Style::default()
     };
-    let bytes = tokio::task::spawn_blocking(move || render::render(&payload, input.format, &style))
-        .await
-        .map_err(|_| ApiError::internal())??;
+    let bytes = state
+        .render_job(move || {
+            let mut style = style;
+            if let Some(logo) = input.logo {
+                style.logo = Some(render::normalize_logo(&logo)?);
+            }
+            render::render(&payload, input.format, &style)
+        })
+        .await?;
     let content_type = match input.format {
         Format::Png => "image/png",
         Format::Svg => "image/svg+xml",

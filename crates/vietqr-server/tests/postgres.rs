@@ -9,7 +9,10 @@ use vietqr_server::{AppState, MIGRATOR, create_key, key_hash, router};
 
 fn request(key: &str, body: Value) -> Request<Body> {
     Request::post("/v1/qr")
-        .header("authorization", format!("Bearer {key}"))
+        .extension(axum::extract::ConnectInfo(
+            "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .header("authorization", format!("bEaReR {key}"))
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()

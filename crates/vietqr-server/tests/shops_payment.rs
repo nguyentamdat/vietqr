@@ -19,6 +19,9 @@ async fn call(
     let mut request = Request::builder()
         .method(method)
         .uri(path)
+        .extension(axum::extract::ConnectInfo(
+            "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+        ))
         .header("content-type", "application/json");
     if let Some(key) = key {
         request = request.header("authorization", format!("Bearer {key}"));
@@ -465,6 +468,9 @@ async fn payment_page_escaping_overrides_cache_watermarks_and_decoding() {
         .clone()
         .oneshot(
             Request::get(&png_url)
+                .extension(axum::extract::ConnectInfo(
+                    "127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap(),
+                ))
                 .header("if-none-match", free_etag)
                 .body(Body::empty())
                 .unwrap(),

@@ -206,9 +206,9 @@ pub(super) async fn qr_image(
     };
     let payment = load(&state, &slug, overrides(query)?).await?;
     let (version, payload, style) = (payment.version, payment.payload, payment.style);
-    let bytes = tokio::task::spawn_blocking(move || render::render(&payload, format, &style))
-        .await
-        .map_err(|_| ApiError::internal())??;
+    let bytes = state
+        .render_job(move || render::render(&payload, format, &style))
+        .await?;
     // Hash the rendered representation too: plan/shop edits and format must invalidate cached images.
     let mut hash = Sha256::new();
     hash.update(version.to_be_bytes());

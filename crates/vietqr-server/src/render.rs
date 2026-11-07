@@ -77,7 +77,7 @@ pub(super) fn validate_colors(fg: &str, bg: &str) -> Result<(), ApiError> {
 fn invalid_logo() -> ApiError {
     ApiError::bad_request(
         "InvalidLogo",
-        "Logo must be base64 PNG/JPEG, at most 256 KiB and 2048x2048 pixels",
+        "Logo must be base64 PNG/JPEG, at most 256 KiB and 1024x1024 pixels",
     )
 }
 
@@ -96,9 +96,9 @@ fn decode_logo(encoded: &str) -> Result<DynamicImage, ApiError> {
         return Err(invalid_logo());
     }
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(2048);
-    limits.max_image_height = Some(2048);
-    limits.max_alloc = Some(32 * 1024 * 1024);
+    limits.max_image_width = Some(1024);
+    limits.max_image_height = Some(1024);
+    limits.max_alloc = Some(16 * 1024 * 1024);
     reader.limits(limits);
     reader.decode().map_err(|_| invalid_logo())
 }
@@ -207,7 +207,7 @@ pub(super) fn render(payload: &str, format: Format, style: &Style) -> Result<Vec
             let fg = format!("#{:02x}{:02x}{:02x}", fg[0], fg[1], fg[2]);
             let bg = format!("#{:02x}{:02x}{:02x}", bg[0], bg[1], bg[2]);
             let mut svg = format!(
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{side}\" height=\"{height}\" viewBox=\"0 0 {side} {height}\"><rect width=\"{side}\" height=\"{height}\" fill=\"white\"/><rect width=\"{side}\" height=\"{side}\" fill=\"{bg}\"/><path fill=\"{fg}\" d=\""
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{side}\" height=\"{height}\" viewBox=\"0 0 {side} {height}\"><rect width=\"{side}\" height=\"{height}\" fill=\"white\"/><rect width=\"{side}\" height=\"{side}\" fill=\"{bg}\"/><path fill=\"{fg}\" d=\""
             );
             for y in 0..width {
                 for x in 0..width {
@@ -283,13 +283,33 @@ fn svg_image(image: RgbaImage, x: u32, y: u32) -> Result<String, ApiError> {
     let (width, height) = image.dimensions();
     let encoded = STANDARD.encode(png(DynamicImage::ImageRgba8(image))?);
     Ok(format!(
-        "<image x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" href=\"data:image/png;base64,{encoded}\"/>"
+        "<image x=\"{x}\" y=\"{y}\" width=\"{width}\" height=\"{height}\" href=\"data:image/png;base64,{encoded}\" xlink:href=\"data:image/png;base64,{encoded}\"/>"
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logo_limits_cover_both_axes_and_accept_1024_rgba16() {
+        for (width, height) in [(1025, 1), (1, 1025), (1024, 1024)] {
+            let image = DynamicImage::ImageRgba16(image::ImageBuffer::from_pixel(
+                width,
+                height,
+                Rgba([65535u16; 4]),
+            ));
+            let mut bytes = Cursor::new(Vec::new());
+            image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+            let normalized = normalize_logo(&STANDARD.encode(bytes.into_inner()));
+            if width <= 1024 && height <= 1024 {
+                let image = image::load_from_memory(&normalized.unwrap()).unwrap();
+                assert!(image.width() <= 240 && image.height() <= 240);
+            } else {
+                assert!(normalized.is_err());
+            }
+        }
+    }
+
     #[test]
     fn colors_require_dark_on_light_high_contrast_hex() {
         for (fg, bg) in [("#000000", "#ffffff"), ("#123456", "#FFFFF0")] {

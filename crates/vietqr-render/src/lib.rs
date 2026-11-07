@@ -1,4 +1,4 @@
-//! QR SVG rendering with error correction M and a four-module quiet zone.
+//! QR SVG rendering with default error correction M (or an explicit level) and a four-module quiet zone.
 
 pub use qrcode::{EcLevel, types::QrError};
 use qrcode::{QrCode, render::svg};
