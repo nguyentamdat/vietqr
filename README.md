@@ -171,6 +171,10 @@ BIND_ADDR=127.0.0.1:3000 cargo run -p vietqr-server
   ví dụ `TRUSTED_PROXY_CIDRS=10.42.1.10/32,fd00::10/128` (thay bằng IP thật, cập nhật khi pod đổi).
   Không tin toàn cluster hoặc `0.0.0.0/0,::/0`: peer tin cậy vẫn có thể giả header nếu ingress
   mở trực tiếp. Không cấu hình trust trước khi hoàn tất các rào mạng này; đây không phải auth.
+- **Cloudflare Tunnel (cloudflared pod) → app trên k3s:** IP pod cloudflared đổi mỗi lần restart,
+  nên có thể tin cả pod CIDR (ví dụ k3s `TRUSTED_PROXY_CIDRS=10.42.0.0/16`) **chỉ khi** NetworkPolicy
+  enforce và chỉ cho pod cloudflared tới app, không có Ingress/NodePort/hostPort/bridge từ host tới app
+  (traffic từ node vào pod mang IP gateway CNI, cũng nằm trong CIDR đó).
 - Semaphore render theo số CPU giữ cả decode/resize/logo/encode trong blocking task,
   kể cả request bị huỷ; global limit chặn số request đang chờ slot render.
   Binary xử lý cả SIGTERM và Ctrl-C để shutdown graceful. Docker build tối ưu server `opt-level=3`.
