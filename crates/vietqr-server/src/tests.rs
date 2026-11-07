@@ -341,13 +341,22 @@ async fn token_format_rejected_before_database_and_bearer_is_case_insensitive() 
 }
 
 #[tokio::test]
-async fn per_ip_limit_precedes_auth_and_only_trusts_cf_when_enabled() {
+async fn per_ip_limit_precedes_auth_and_only_trusts_cf_from_configured_peer() {
     for trusted in [false, true] {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let mut state = AppState::new(pool);
-        state.trust_cf_connecting_ip = trusted;
+        // Even with proxy trust configured, an unlisted peer cannot spoof the header.
+        state.trusted_proxy_cidrs = vec![
+            if trusted {
+                "127.0.0.1/32"
+            } else {
+                "10.42.0.0/24"
+            }
+            .parse()
+            .unwrap(),
+        ];
         let app = router(state);
         for index in 0..=120 {
             let mut req = request(&input());
@@ -384,6 +393,168 @@ async fn per_ip_limit_precedes_auth_and_only_trusts_cf_when_enabled() {
             StatusCode::UNAUTHORIZED
         );
     }
+}
+
+#[test]
+fn ip_bucket_groups_ipv6_by_64_and_normalizes_mapped_ipv4() {
+    let bucket = |ip: &str| ip_bucket(ip.parse().unwrap());
+    assert_eq!(bucket("2001:db8:1:2::1"), bucket("2001:db8:1:2:ffff::abcd"));
+    assert_ne!(bucket("2001:db8:1:2::1"), bucket("2001:db8:1:3::1"));
+    assert_eq!(bucket("::ffff:192.0.2.1"), bucket("192.0.2.1"));
+}
+
+#[tokio::test]
+async fn trusted_proxy_separates_clients_and_invalid_cf_falls_back_to_peer() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let mut state = AppState::new(pool);
+    state.trusted_proxy_cidrs = vec!["127.0.0.1/32".parse().unwrap()];
+    let app = router(state.clone());
+    for cf in [Some("192.0.2.1"), Some("192.0.2.2"), None, Some("invalid")] {
+        let mut req = request(&input());
+        req.headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.1"));
+        if let Some(cf) = cf {
+            req.headers_mut()
+                .insert("cf-connecting-ip", HeaderValue::from_str(cf).unwrap());
+        }
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let limiter = state.ip_limiter.lock().unwrap();
+    assert_eq!(limiter.windows.len(), 3);
+    assert_eq!(
+        limiter.windows[&"127.0.0.1".parse::<IpAddr>().unwrap()].1,
+        2
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_bodies_time_out_without_starving_public_payment_routes() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let state = AppState::new(pool);
+    // Exercise the production guard without requiring DB/auth for the downstream routes.
+    let app = Router::new()
+        .route("/v1/qr", post(|| async { "ok" }))
+        .route("/p/{slug}", get(|| async { "payment" }))
+        .layer(middleware::from_fn_with_state(state.clone(), guard_request));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..64 {
+        let req = Request::post("/v1/qr")
+            .extension(ConnectInfo("127.0.0.1:1234".parse::<SocketAddr>().unwrap()))
+            .header(header::CONTENT_LENGTH, "360000")
+            .body(Body::from_stream(tokio_stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        tasks.spawn(app.clone().oneshot(req));
+    }
+    for _ in 0..64 {
+        if state.requests.available_permits() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(state.requests.available_permits(), 0);
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&input()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let mut public = request(&input());
+    *public.method_mut() = axum::http::Method::GET;
+    *public.uri_mut() = "/p/test".parse().unwrap();
+    assert_eq!(app.oneshot(public).await.unwrap().status(), StatusCode::OK);
+    tokio::time::advance(BODY_TIMEOUT).await;
+    while let Some(response) = tasks.join_next().await {
+        let response = response.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+    assert_eq!(state.requests.available_permits(), 64);
+    assert_eq!(state.public_requests.available_permits(), 16);
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_deadline_cancels_stalled_handler_and_restores_permit() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let state = AppState::new(pool);
+    let app = Router::new()
+        .route("/v1/qr", post(std::future::pending::<&'static str>))
+        .layer(middleware::from_fn_with_state(state.clone(), guard_request));
+    let response = app.oneshot(request(&input())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(state.requests.available_permits(), 64);
+}
+
+#[tokio::test]
+async fn public_error_responses_are_not_cached() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let state = AppState::new(pool);
+    let app = Router::new()
+        .route("/p/{slug}/{image}", get(|| async { StatusCode::NOT_FOUND }))
+        .layer(middleware::from_fn_with_state(state.clone(), guard_request));
+    for status in [
+        StatusCode::NOT_FOUND,
+        StatusCode::BAD_REQUEST,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let held = if status == StatusCode::SERVICE_UNAVAILABLE {
+            Some(
+                state
+                    .public_requests
+                    .clone()
+                    .acquire_many_owned(16)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let mut req = request(&input());
+        *req.method_mut() = axum::http::Method::GET;
+        *req.uri_mut() = "/p/test/qr.svg".parse().unwrap();
+        if status == StatusCode::BAD_REQUEST {
+            *req.body_mut() = Body::from(vec![0u8; BODY_LIMIT + 1]);
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let mut limiter = state.ip_limiter.lock().unwrap();
+            for _ in 0..120 {
+                limiter.allow("127.0.0.1".parse().unwrap(), Instant::now(), 120);
+            }
+        }
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        drop(held);
+    }
+}
+
+#[test]
+fn rate_limiter_cleans_periodically_but_each_bucket_expires_independently() {
+    let mut limiter = RateLimiter::default();
+    let now = Instant::now();
+    assert!(limiter.allow(1, now, 1));
+    assert!(limiter.allow(2, now + Duration::from_secs(30), 1));
+    assert!(limiter.allow(3, now + Duration::from_secs(60), 1));
+    assert!(!limiter.windows.contains_key(&1));
+    // No full-map sweep until the next minute; bucket 2 must still reset now.
+    assert!(limiter.allow(2, now + Duration::from_secs(90), 1));
+    assert_eq!(limiter.last_cleanup, now + Duration::from_secs(60));
+    assert!(!limiter.allow(2, now + Duration::from_secs(90), 1));
 }
 
 #[tokio::test]

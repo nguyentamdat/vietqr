@@ -33,6 +33,9 @@ async fn call(
         .unwrap();
     let status = response.status();
     let headers = response.headers().clone();
+    if path.starts_with("/p/") && (status.is_client_error() || status.is_server_error()) {
+        assert_eq!(headers["cache-control"], "no-store");
+    }
     let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
         .await
         .unwrap()
@@ -318,6 +321,25 @@ async fn shops_templates_links_migrations_crud_and_ownership() {
         StatusCode::CONFLICT,
     )
     .await;
+    for slug in [
+        json!(format!("renamed-{b}")),
+        link["slug"].clone(),
+        json!(null),
+    ] {
+        json_call(
+            &app,
+            "PATCH",
+            &lpath,
+            &key_b,
+            json!({"slug":slug}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    assert_eq!(
+        json_call(&app, "GET", &lpath, &key_b, json!(null), StatusCode::OK).await["slug"],
+        link["slug"]
+    );
     json_call(
         &app,
         "DELETE",

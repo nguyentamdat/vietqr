@@ -32,9 +32,10 @@ pub struct AppState {
     limiter: Arc<Mutex<RateLimiter<i64>>>,
     ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
     requests: Arc<Semaphore>,
+    public_requests: Arc<Semaphore>,
     render_slots: Arc<Semaphore>,
-    /// Enable only when direct access is blocked and a trusted proxy overwrites CF-Connecting-IP.
-    pub trust_cf_connecting_ip: bool,
+    /// Only these peers may relay CF-Connecting-IP; block traffic bypassing Cloudflare.
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
 }
 
 impl AppState {
@@ -44,10 +45,11 @@ impl AppState {
             limiter: Arc::new(Mutex::new(RateLimiter::default())),
             ip_limiter: Arc::new(Mutex::new(RateLimiter::default())),
             requests: Arc::new(Semaphore::new(64)),
+            public_requests: Arc::new(Semaphore::new(16)),
             render_slots: Arc::new(Semaphore::new(
                 std::thread::available_parallelism().map_or(1, usize::from),
             )),
-            trust_cf_connecting_ip: false,
+            trusted_proxy_cidrs: Vec::new(),
         }
     }
 
@@ -92,7 +94,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(shops::deactivate_link),
         )
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate))
-        .layer(DefaultBodyLimit::max(360 * 1024))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .route("/p/{slug}", get(payment::page))
         .route("/p/{slug}/{image}", get(payment::qr_image))
         .layer(middleware::from_fn_with_state(state.clone(), guard_request))
@@ -120,12 +122,43 @@ pub async fn create_key(pool: &PgPool) -> Result<String, Box<dyn std::error::Err
     Ok(key)
 }
 
-async fn guard_request(
-    State(state): State<AppState>,
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const BODY_TIMEOUT: Duration = Duration::from_secs(5);
+const BODY_LIMIT: usize = 360 * 1024;
+
+async fn guard_request(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, guarded_request(state, request, next)).await;
+    let mut response = result
+        .unwrap_or_else(|_| Err(request_timeout()))
+        .unwrap_or_else(IntoResponse::into_response);
+    if response.status().is_client_error() || response.status().is_server_error() {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+fn request_timeout() -> ApiError {
+    ApiError::new(
+        StatusCode::REQUEST_TIMEOUT,
+        "RequestTimeout",
+        "Request timed out",
+    )
+}
+
+async fn guarded_request(
+    state: AppState,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let _permit = state.requests.clone().try_acquire_owned().map_err(|_| {
+    // Public payment traffic cannot be starved by slow API uploads.
+    let requests = if request.uri().path().starts_with("/p/") {
+        &state.public_requests
+    } else {
+        &state.requests
+    };
+    let _permit = requests.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "Busy",
@@ -138,7 +171,11 @@ async fn guard_request(
         .ok_or_else(ApiError::internal)?
         .0
         .ip();
-    let ip = if state.trust_cf_connecting_ip {
+    let ip = if state
+        .trusted_proxy_cidrs
+        .iter()
+        .any(|cidr| cidr.contains(&peer))
+    {
         request
             .headers()
             .get("cf-connecting-ip")
@@ -152,15 +189,32 @@ async fn guard_request(
         .ip_limiter
         .lock()
         .map_err(|_| ApiError::internal())?
-        .allow(ip, Instant::now(), 120)
+        .allow(ip_bucket(ip), Instant::now(), 120)
     {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RateLimited",
-            "120 requests per minute per IP",
+            "120 requests per minute per IP (IPv6 /64)",
         ));
     }
-    Ok(next.run(request).await)
+    let (parts, body) = request.into_parts();
+    let bytes = tokio::time::timeout(BODY_TIMEOUT, axum::body::to_bytes(body, BODY_LIMIT))
+        .await
+        .map_err(|_| request_timeout())?
+        .map_err(|_| ApiError::bad_request("InvalidRequest", "Invalid body or body size"))?;
+    Ok(next
+        .run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await)
+}
+
+fn ip_bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => IpAddr::V4(ip),
+            None => IpAddr::V6((u128::from(ip) & (u128::MAX << 64)).into()),
+        },
+        ip => ip,
+    }
 }
 
 fn bearer_token(value: &str) -> Option<&str> {
@@ -213,12 +267,14 @@ async fn authenticate(
 
 struct RateLimiter<K> {
     windows: HashMap<K, (Instant, u32)>,
+    last_cleanup: Instant,
 }
 
 impl<K> Default for RateLimiter<K> {
     fn default() -> Self {
         Self {
             windows: HashMap::new(),
+            last_cleanup: Instant::now(),
         }
     }
 }
@@ -226,9 +282,16 @@ impl<K> Default for RateLimiter<K> {
 impl<K: Eq + Hash> RateLimiter<K> {
     fn allow(&mut self, id: K, now: Instant, limit: u32) -> bool {
         let window = Duration::from_secs(60);
-        self.windows
-            .retain(|_, (start, _)| now.duration_since(*start) < window);
-        let (_, count) = self.windows.entry(id).or_insert((now, 0));
+        if now.duration_since(self.last_cleanup) >= window {
+            self.windows
+                .retain(|_, (start, _)| now.duration_since(*start) < window);
+            self.last_cleanup = now;
+        }
+        let (start, count) = self.windows.entry(id).or_insert((now, 0));
+        if now.duration_since(*start) >= window {
+            *start = now;
+            *count = 0;
+        }
         if *count >= limit {
             return false;
         }

@@ -7,8 +7,10 @@ RUN cargo build --locked --release -p vietqr-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -m 755 /usr/share/doc/vietqr-server
 COPY --from=build /app/target/release/vietqr-server /usr/local/bin/vietqr-server
+COPY --chmod=644 crates/vietqr-server/assets/DejaVuSans-LICENSE.txt /usr/share/doc/vietqr-server/DejaVuSans-LICENSE.txt
 USER 65532:65532
 ENV BIND_ADDR=0.0.0.0:3000
 EXPOSE 3000

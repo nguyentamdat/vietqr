@@ -363,10 +363,14 @@ pub(super) async fn update_link(
         default_memo: old.default_memo,
         active: old.active,
     };
-    let mut input: LinkInput = patched(old, body)?;
+    let Json(patch) = body.map_err(|_| invalid("Invalid JSON"))?;
+    if patch.get("slug").is_some() {
+        return Err(invalid("slug is immutable"));
+    }
+    let mut input: LinkInput = patched(old, Ok(Json(patch)))?;
     input.validate(&state.pool, shop).await?;
-    let row = sqlx::query_as("UPDATE links SET slug=$3, template_id=$4, default_amount=$5, default_memo=$6, active=$7 WHERE id=$1 AND shop_id=$2 RETURNING *")
-        .bind(id).bind(shop).bind(input.slug).bind(input.template_id).bind(input.default_amount.map(|v| v as i64)).bind(input.default_memo).bind(input.active)
+    let row = sqlx::query_as("UPDATE links SET template_id=$3, default_amount=$4, default_memo=$5, active=$6 WHERE id=$1 AND shop_id=$2 RETURNING *")
+        .bind(id).bind(shop).bind(input.template_id).bind(input.default_amount.map(|v| v as i64)).bind(input.default_memo).bind(input.active)
         .fetch_one(&state.pool).await?;
     Ok(Json(row))
 }

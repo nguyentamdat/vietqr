@@ -155,11 +155,22 @@ BIND_ADDR=127.0.0.1:3000 cargo run -p vietqr-server
   Thu hồi bằng `UPDATE api_keys SET revoked_at = now() WHERE id = ...`;
   kiểm tra DB mỗi request, không cache quyền. Token sai dạng `vqr_` + 64 hex bị loại trước DB;
   scheme Bearer không phân biệt hoa thường.
-- **120 request/phút/IP** trước auth/DB, áp cả trang/ảnh public; global tối đa **64 request**
-  đang xử lý (đầy → 503, không xếp hàng vô hạn); `/healthz` miễn các giới hạn này.
-  Peer IP lấy từ `ConnectInfo`. `TRUST_CF_CONNECTING_IP=false` mặc định, bỏ qua header CF.
-  Chỉ đặt `true` nếu proxy tin cậy **ghi đè** header và đã chặn mọi truy cập trực tiếp vào backend;
-  nếu không, khách có thể giả IP. Thiếu/header CF lỗi dùng peer IP.
+- **120 request/phút/IP** (IPv6 gom theo **/64**) trước auth/DB, áp cả trang/ảnh public;
+  dọn bucket hết hạn mỗi phút. Tối đa **64 request API + 16 request public** độc lập
+  (đầy → 503); `/healthz` miễn các giới hạn này. Deadline request **15s**, đọc toàn bộ body
+  tối đa **5s / 360 KiB**, quá giờ → **408**. Lỗi trả `Cache-Control: no-store`.
+- IP mặc định lấy từ peer `ConnectInfo`, không tin header. `TRUSTED_PROXY_CIDRS` là danh sách
+  CIDR IPv4/IPv6 phân cách bằng dấu phẩy (mặc định rỗng, CIDR sai → lỗi startup).
+  Chỉ khi peer thuộc danh sách mới đọc **một IP** trong `CF-Connecting-IP`; thiếu/sai dùng peer.
+  Không dùng `X-Forwarded-For`; cấu hình cũ `TRUST_CF_CONNECTING_IP` không còn tác dụng.
+  Sau proxy mà không cấu hình trust, tất cả khách dùng chung bucket của proxy.
+- **Cloudflare → Traefik → app:** khoá origin/Traefik chỉ nhận traffic từ Cloudflare
+  (firewall theo dải IP Cloudflare hoặc tunnel); Traefik phải bảo toàn header CF do Cloudflare
+  ghi đè, không cho đường direct vào ingress/backend. NetworkPolicy chỉ cho pod Traefik tới app.
+  Đặt `TRUSTED_PROXY_CIDRS` theo **peer IP thực tế của Traefik**, ưu tiên /32 hoặc /128;
+  ví dụ `TRUSTED_PROXY_CIDRS=10.42.1.10/32,fd00::10/128` (thay bằng IP thật, cập nhật khi pod đổi).
+  Không tin toàn cluster hoặc `0.0.0.0/0,::/0`: peer tin cậy vẫn có thể giả header nếu ingress
+  mở trực tiếp. Không cấu hình trust trước khi hoàn tất các rào mạng này; đây không phải auth.
 - Semaphore render theo số CPU giữ cả decode/resize/logo/encode trong blocking task,
   kể cả request bị huỷ; global limit chặn số request đang chờ slot render.
   Binary xử lý cả SIGTERM và Ctrl-C để shutdown graceful. Docker build tối ưu server `opt-level=3`.
@@ -206,7 +217,8 @@ UPDATE api_keys SET shop_id = <shop_id> WHERE prefix = '<prefix_key>';
   `GET/PATCH /v1/links/{id}` → 200; `DELETE /v1/links/{id}` → 204 **vô hiệu hoá**, không xoá dữ liệu.
   JSON: `slug` bắt buộc, unique toàn hệ thống `[a-z0-9-]{3,40}`, `template_id`,
   `default_amount` (nguyên VND), `default_memo` nullable; `active` default true.
-  PATCH chỉ gửi field cần đổi; null xoá field nullable. Slug trùng → 409.
+  PATCH chỉ gửi field cần đổi; null xoá field nullable. Slug bất biến: PATCH có `slug`
+  (kể cả null/giá trị cũ) → 400; POST slug trùng → 409.
 - `POST /v1/qr` thêm `template_id` của shop; không gửi đồng thời `logo`.
   Template áp màu/logo/khung/tên shop; không thay đổi bank/account trong request.
 - `GET /p/{slug}` công khai, HTML tiếng Việt, copy STK/số tiền/memo; CSP hash chỉ cho CSS/script

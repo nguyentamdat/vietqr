@@ -22,10 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("vietqr-server listening on {}", listener.local_addr()?);
     let mut state = AppState::new(pool);
-    state.trust_cf_connecting_ip = match std::env::var("TRUST_CF_CONNECTING_IP").as_deref() {
-        Ok("true") => true,
-        Ok("false") | Err(std::env::VarError::NotPresent) => false,
-        _ => return Err("TRUST_CF_CONNECTING_IP must be true or false".into()),
+    state.trusted_proxy_cidrs = match std::env::var("TRUSTED_PROXY_CIDRS") {
+        Ok(value) if !value.trim().is_empty() => value
+            .split(',')
+            .map(|cidr| cidr.trim().parse())
+            .collect::<Result<_, _>>()?,
+        Ok(_) | Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(error) => return Err(error.into()),
     };
     axum::serve(
         listener,

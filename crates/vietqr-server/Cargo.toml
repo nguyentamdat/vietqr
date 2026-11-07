@@ -9,7 +9,7 @@ license.workspace = true
 vietqr-core = { path = "../vietqr-core" }
 vietqr-render = { path = "../vietqr-render" }
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 base64 = "0.22"
 getrandom = { version = "0.3", features = ["std"] }
@@ -19,10 +19,13 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 qrcode = { version = "0.14", default-features = false }
 serde_json = "1"
 ab_glyph = "0.2"
+ipnet = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 rqrr = "0.10"
+tokio = { version = "1", features = ["test-util"] }
+tokio-stream = "0.1"
 
 [lints]
 workspace = true
