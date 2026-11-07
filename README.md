@@ -1,10 +1,10 @@
 # vietqr
 
-Workspace Rust offline tạo/đọc chuỗi **VietQR NAPAS 247** (EMVCo Merchant-Presented
-Mode, profile chuyển khoản theo TCCS 03:2018/NHNN), render SVG và WASM adapter.
-Ba crate: `vietqr-core`, `vietqr-render`, `vietqr-wasm`. Core **không dependency**,
-không mạng, filesystem, thread hay clock.
-MIT; repo chỉ local, chưa quyết định public/private. `publish = false`.
+Workspace Rust tạo/đọc chuỗi **VietQR NAPAS 247** (EMVCo Merchant-Presented
+Mode, profile chuyển khoản theo TCCS 03:2018/NHNN), render SVG, WASM adapter và API PNG/SVG.
+Bốn crate: `vietqr-core`, `vietqr-render`, `vietqr-wasm`, `vietqr-server`. Core **không dependency**,
+không mạng, filesystem, thread hay clock. MIT; repo public. Riêng server `publish = false`.
+Push tag `vX.Y.Z` kích hoạt release crates.io/npm; không dùng tag để chạy server local.
 
 ## Dùng thử
 
@@ -124,6 +124,55 @@ khác npm cắt âm thầm. Cả parser Rust và npm nhận hai profile.
 `vietqr@1.1.9` (Casso/MIT) chỉ là client API; không gọi API, không dùng credentials.
 Không có npm dependency hay `node_modules` trong repo.
 
+## Server M1 (Postgres, chạy local)
+
+```sh
+# Chỉ dùng database riêng/disposable cho ví dụ và test.
+docker run --rm --name vietqr-db -e POSTGRES_PASSWORD=local-only \
+  -e POSTGRES_DB=vietqr -p 127.0.0.1:5432:5432 -d postgres:17-alpine
+export DATABASE_URL=postgres://postgres:local-only@127.0.0.1:5432/vietqr
+# Tự chạy migration embedded; in secret một lần, DB chỉ giữ SHA-256 và prefix.
+export VIETQR_KEY="$(cargo run -q -p vietqr-server -- create-key)"
+BIND_ADDR=127.0.0.1:3000 cargo run -p vietqr-server
+```
+
+- `GET /healthz`: liveness không auth (không kiểm tra kết nối DB).
+- `POST /v1/qr`: `Authorization: Bearer <key>`; trả bytes PNG/SVG, header
+  `X-VietQR-Payload` chứa payload chính xác, `Cache-Control: no-store`.
+  JSON bắt buộc: `bank_bin`, `account`, `format: "png" | "svg"`;
+  tuỳ chọn `service: "account" | "card"` (default account), `profile: "npm" | "strict"`
+  (default npm), `name`, `amount` (nguyên VND), `memo`, `logo` (base64 chuẩn, không data URL).
+  Các field name/amount/memo/logo có thể thiếu/null; từ chối field lạ.
+- Logo chỉ PNG/JPEG, tối đa **256 KiB decoded**, **2048×2048 pixel**; decode có giới hạn
+  allocation rồi re-encode PNG, không giữ metadata/file gốc, không nhận SVG.
+  PNG/SVG có logo dùng ECC **H**, ô trắng gồm padding chiếm ≤6,25% diện tích module;
+  giữ quiet zone 4 module. PNG 8 pixel/module; SVG nhúng raster logo đã re-encode.
+- Lỗi validation JSON **400** `{ "code": "InvalidBin", "message": "..." }` (mã lỗi
+  ngữ nghĩa từ enum core); JSON sai kiểu/format/body quá 360 KiB → `InvalidRequest`,
+  logo sai → `InvalidLogo`. Key thiếu/sai/đã thu hồi → **401**; DB lỗi → **500**.
+- **60 request/phút/key**, fixed window trong bộ nhớ (kể cả request validation lỗi);
+  quá hạn → **429**, `Retry-After: 60`. Restart reset bộ đếm; chỉ dùng 1 replica ở M1.
+  Thu hồi bằng `UPDATE api_keys SET revoked_at = now() WHERE id = ...`;
+  kiểm tra DB mỗi request, không cache quyền. M1 chưa có shop/template/billing.
+
+```sh
+curl -sS http://127.0.0.1:3000/healthz
+curl -sS -D /tmp/qr-headers -o /tmp/qr.png http://127.0.0.1:3000/v1/qr \
+  -H "Authorization: Bearer $VIETQR_KEY" -H 'Content-Type: application/json' \
+  -d '{"bank_bin":"970436","account":"0000000000","amount":10000,"memo":"TEST M1","format":"png"}'
+# DB test không tự chạy trong cargo test --workspace:
+TEST_DATABASE_URL="$DATABASE_URL" cargo test -p vietqr-server --test postgres -- --ignored
+# Build/run local, không publish image:
+docker build -t vietqr-server:m1 .
+docker run --rm -p 127.0.0.1:3000:3000 -e DATABASE_URL='<URL DB container truy cập được>' vietqr-server:m1
+# CLI tạo key trong image: thêm `create-key` sau tên image.
+```
+
+Không log/lưu payload hay logo; chỉ lưu bảng `api_keys` và metadata migration sqlx.
+Chỉ đưa API ra ngoài sau reverse proxy HTTPS; không gửi key qua HTTP công khai.
+Test rqrr decode logo là kiểm tra tự động, **không thay thế quét app ngân hàng thật**.
+Không dùng tài khoản giả trong ví dụ để chuyển tiền thật.
+
 ## SVG và WASM
 
 `vietqr-render::render_svg(&str) -> Result<String, QrError>` dùng
@@ -202,5 +251,7 @@ npm defaults (59=NA if unnamed, 60=VN, memo/name limit 50); opt into
 `generate_with_profile(..., Profile::Strict)` for the original 25-character profile
 without defaults. Neither profile truncates. Parsing accepts both profiles.
 Payload limit: 512 bytes. Unverified NAPAS-specific limits remain documented above.
-Valid CRC is not payment confirmation. Local-only, MIT, publishing disabled.
-No PNG, server, payment calls or demo UI in this repository.
+Valid CRC is not payment confirmation. MIT, public repository; the server alone is
+non-publishable. The optional `vietqr-server` provides authenticated PNG/SVG generation
+with raster logos, Postgres hashed API keys and a single-process rate limit. No payment
+processing, bank verification, billing or hosted deployment is included.

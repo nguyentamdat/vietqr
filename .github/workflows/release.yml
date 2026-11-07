@@ -45,7 +45,7 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates
       - name: Publish crates
-        run: cargo publish --workspace --locked
+        run: cargo publish --workspace --exclude vietqr-server --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates.outputs.token }}
 

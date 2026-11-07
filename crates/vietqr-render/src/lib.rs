@@ -1,11 +1,16 @@
 //! QR SVG rendering with error correction M and a four-module quiet zone.
 
-pub use qrcode::types::QrError;
-use qrcode::{EcLevel, QrCode, render::svg};
+pub use qrcode::{EcLevel, types::QrError};
+use qrcode::{QrCode, render::svg};
 
 /// Encodes any payload as QR, without validating VietQR semantics.
 pub fn render_svg(payload: &str) -> Result<String, QrError> {
-    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M)?;
+    render_svg_with_ec_level(payload, EcLevel::M)
+}
+
+/// Encodes with an explicit correction level; the quiet zone remains four modules.
+pub fn render_svg_with_ec_level(payload: &str, ec_level: EcLevel) -> Result<String, QrError> {
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), ec_level)?;
     let image = code
         .render::<svg::Color>()
         .quiet_zone(true)
@@ -32,6 +37,20 @@ mod tests {
         assert!(svg.contains(&format!("viewBox=\"0 0 {side} {side}\"")));
         assert!(!svg.contains("<script>"));
         assert!(svg.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn render_svg_with_ec_level_h_keeps_quiet_zone() {
+        let payload = "logo overlay payload";
+        let code = QrCode::with_error_correction_level(payload, EcLevel::H).unwrap();
+        let svg = render_svg_with_ec_level(payload, EcLevel::H).unwrap();
+        let side = code.width() + 8;
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains(&format!("viewBox=\"0 0 {side} {side}\"")));
+        assert_eq!(
+            render_svg_with_ec_level(payload, EcLevel::M).unwrap(),
+            render_svg(payload).unwrap()
+        );
     }
 
     #[test]

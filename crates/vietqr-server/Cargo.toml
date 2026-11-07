@@ -1,0 +1,27 @@
+[package]
+name = "vietqr-server"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vietqr-core = { path = "../vietqr-core" }
+vietqr-render = { path = "../vietqr-render" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+getrandom = { version = "0.3", features = ["std"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "migrate", "macros"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+qrcode = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+rqrr = "0.10"
+
+[lints]
+workspace = true
