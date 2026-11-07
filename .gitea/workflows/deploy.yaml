@@ -1,0 +1,101 @@
+# Gitea-only (GitHub Actions ignores .gitea/; Gitea ignores .github/ while this dir exists).
+# Tests run in GitHub CI; this job builds the server image and pins its digest in GitOps.
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: vietqr-k8s
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 1
+
+      - name: Build image and update GitOps
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags --depth=1 origin main
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            echo "A newer main commit exists; skipping stale deployment."
+            exit 0
+          fi
+
+          install -d -m 700 "$RUNNER_TEMP"
+          temp_root="$(mktemp -d "$RUNNER_TEMP/deploy.XXXXXX")"
+          trap 'rm -rf "$temp_root"' EXIT
+
+          export DOCKER_CONFIG="$temp_root/docker"
+          install -d -m 700 "$DOCKER_CONFIG"
+          auth="$(printf 'dat:%s' "$REGISTRY_TOKEN" | base64 | tr -d '\n')"
+          jq -n --arg auth "$auth" \
+            '{"auths":{"gitea.bongsenlen.io.vn":{"auth":$auth}}}' \
+            >"$DOCKER_CONFIG/config.json"
+          chmod 600 "$DOCKER_CONFIG/config.json"
+
+          metadata="$temp_root/build-metadata.json"
+          buildctl build \
+            --frontend dockerfile.v0 \
+            --local context="$GITHUB_WORKSPACE" \
+            --local dockerfile="$GITHUB_WORKSPACE" \
+            --output "type=image,name=gitea.bongsenlen.io.vn/dat/vietqr-server:git-$GITHUB_SHA,push=true" \
+            --metadata-file "$metadata"
+          digest="$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata")"
+          image="gitea.bongsenlen.io.vn/dat/vietqr-server@$digest"
+
+          askpass="$temp_root/git-askpass"
+          cat >"$askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' ci-gitops ;;
+            *Password*) printf '%s\n' "$GITOPS_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass"
+          export GIT_TERMINAL_PROMPT=0
+
+          git clone --depth=1 --branch master \
+            https://gitea.bongsenlen.io.vn/dat/infra-homeserver.git \
+            "$temp_root/gitops"
+          cd "$temp_root/gitops"
+          python3 scripts/update-image-reference.py \
+            clusters/home-k3s/apps/vietqr.yaml \
+            vietqr-server \
+            "$image" \
+            1
+
+          if git diff --quiet; then
+            echo "GitOps already references $image"
+            exit 0
+          fi
+          [ "$(git diff --name-only)" = "clusters/home-k3s/apps/vietqr.yaml" ]
+          git diff --check
+          git config user.name gitea-actions
+          git config user.email gitea-actions@bongsenlen.io.vn
+          git add clusters/home-k3s/apps/vietqr.yaml
+          git commit -m "ci(vietqr): deploy ${GITHUB_SHA:0:12} [skip ci]"
+
+          for attempt in 1 2 3; do
+            git fetch origin master
+            git rebase origin/master
+            if git push origin HEAD:master; then
+              exit 0
+            fi
+            sleep "$((attempt * 2))"
+          done
+          echo "Failed to push GitOps update after 3 attempts." >&2
+          exit 1
